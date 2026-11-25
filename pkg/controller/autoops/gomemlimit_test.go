@@ -18,73 +18,23 @@ import (
 )
 
 func Test_goMemLimitFor(t *testing.T) {
-	memory := func(quantity string) corev1.ResourceList {
-		return corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)}
-	}
 	for _, tt := range []struct {
-		name      string
-		resources corev1.ResourceRequirements
-		want      string
-		wantOK    bool
+		name   string
+		limits corev1.ResourceList
+		want   string
+		wantOK bool
 	}{
-		{
-			name:      "default resources",
-			resources: defaultResources,
-			want:      "320MiB",
-			wantOK:    true,
-		},
-		{
-			name:      "limit is used over the request",
-			resources: corev1.ResourceRequirements{Limits: memory("1Gi"), Requests: memory("512Mi")},
-			want:      "819MiB",
-			wantOK:    true,
-		},
-		{
-			name:      "request is used when there is no limit",
-			resources: corev1.ResourceRequirements{Requests: memory("512Mi")},
-			want:      "409MiB",
-			wantOK:    true,
-		},
-		{
-			name: "request is used when limits only set cpu",
-			resources: corev1.ResourceRequirements{
-				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-				Requests: memory("200Mi"),
-			},
-			want:   "160MiB",
-			wantOK: true,
-		},
-		{
-			name:      "decimal quantity is rounded down to a whole MiB",
-			resources: corev1.ResourceRequirements{Limits: memory("1G")},
-			want:      "762MiB",
-			wantOK:    true,
-		},
-		{
-			name:      "very large limit does not overflow",
-			resources: corev1.ResourceRequirements{Limits: memory("4Ei")},
-			want:      "3518437208883MiB",
-			wantOK:    true,
-		},
-		{
-			name:      "no resources",
-			resources: corev1.ResourceRequirements{},
-		},
-		{
-			name:      "empty limits and requests, as used with a LimitRange",
-			resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{}, Requests: corev1.ResourceList{}},
-		},
-		{
-			name:      "zero limit and no request",
-			resources: corev1.ResourceRequirements{Limits: memory("0")},
-		},
-		{
-			name:      "limit too small for a whole MiB",
-			resources: corev1.ResourceRequirements{Limits: memory("1Mi")},
-		},
+		{name: "default limit", limits: defaultResources.Limits, want: "320MiB", wantOK: true},
+		{name: "decimal quantity is rounded down", limits: memory("1G"), want: "762MiB", wantOK: true},
+		{name: "exact MiB is not rounded down twice", limits: memory("640Mi"), want: "512MiB", wantOK: true},
+		{name: "exact MiB on a large limit", limits: memory("5Gi"), want: "4096MiB", wantOK: true},
+		{name: "1.25Mi gives exactly 1MiB", limits: memory("1.25Mi"), want: "1MiB", wantOK: true},
+		{name: "very large limit does not overflow", limits: memory("4Ei"), want: "3518437208883MiB", wantOK: true},
+		{name: "no memory limit", limits: nil},
+		{name: "limit too small for a whole MiB", limits: memory("1Mi")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := goMemLimitFor(tt.resources)
+			got, ok := goMemLimitFor(tt.limits)
 			require.Equal(t, tt.wantOK, ok)
 			require.Equal(t, tt.want, got)
 		})
@@ -115,27 +65,10 @@ func TestAutoOpsGoMemLimit(t *testing.T) {
 		want *corev1.EnvVar
 	}{
 		{
-			name:   "default resources",
-			mutate: func(*autoopsv1alpha1.AutoOpsAgentPolicy) {},
-			want:   &corev1.EnvVar{Name: "GOMEMLIMIT", Value: "320MiB"},
-		},
-		{
-			name: "follows the memory limit of the resources field",
-			mutate: func(p *autoopsv1alpha1.AutoOpsAgentPolicy) {
-				p.Spec.Resources = commonv1.Resources{
-					Requests: commonv1.ResourceAllocations{Memory: new(resource.MustParse("512Mi"))},
-					Limits:   commonv1.ResourceAllocations{Memory: new(resource.MustParse("1Gi"))},
-				}
-			},
-			want: &corev1.EnvVar{Name: "GOMEMLIMIT", Value: "819MiB"},
-		},
-		{
 			name: "follows the memory limit of the podTemplate",
 			mutate: func(p *autoopsv1alpha1.AutoOpsAgentPolicy) {
 				p.Spec.PodTemplate = podTemplateWith(corev1.Container{
-					Resources: corev1.ResourceRequirements{
-						Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("800Mi")},
-					},
+					Resources: corev1.ResourceRequirements{Limits: memory("800Mi")},
 				})
 			},
 			want: &corev1.EnvVar{Name: "GOMEMLIMIT", Value: "640MiB"},
@@ -144,9 +77,7 @@ func TestAutoOpsGoMemLimit(t *testing.T) {
 			name: "resources field wins over the podTemplate",
 			mutate: func(p *autoopsv1alpha1.AutoOpsAgentPolicy) {
 				p.Spec.PodTemplate = podTemplateWith(corev1.Container{
-					Resources: corev1.ResourceRequirements{
-						Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("200Mi")},
-					},
+					Resources: corev1.ResourceRequirements{Limits: memory("200Mi")},
 				})
 				p.Spec.Resources = commonv1.Resources{
 					Limits: commonv1.ResourceAllocations{Memory: new(resource.MustParse("2Gi"))},
@@ -155,37 +86,13 @@ func TestAutoOpsGoMemLimit(t *testing.T) {
 			want: &corev1.EnvVar{Name: "GOMEMLIMIT", Value: "1638MiB"},
 		},
 		{
-			name: "falls back to the memory request when there is no memory limit",
+			name: "not set without a memory limit, even with a memory request",
 			mutate: func(p *autoopsv1alpha1.AutoOpsAgentPolicy) {
 				p.Spec.PodTemplate = podTemplateWith(corev1.Container{
-					Resources: corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("500Mi")},
-					},
-				})
-			},
-			want: &corev1.EnvVar{Name: "GOMEMLIMIT", Value: "400MiB"},
-		},
-		{
-			name: "not set when there is neither a memory limit nor a memory request",
-			mutate: func(p *autoopsv1alpha1.AutoOpsAgentPolicy) {
-				// Empty limits and requests disable the operator defaults, for example to rely on a LimitRange.
-				p.Spec.PodTemplate = podTemplateWith(corev1.Container{
-					Resources: corev1.ResourceRequirements{
-						Limits:   corev1.ResourceList{},
-						Requests: corev1.ResourceList{},
-					},
+					Resources: corev1.ResourceRequirements{Requests: memory("500Mi")},
 				})
 			},
 			want: nil,
-		},
-		{
-			name: "user-provided value wins",
-			mutate: func(p *autoopsv1alpha1.AutoOpsAgentPolicy) {
-				p.Spec.PodTemplate = podTemplateWith(corev1.Container{
-					Env: []corev1.EnvVar{{Name: "GOMEMLIMIT", Value: "250MiB"}},
-				})
-			},
-			want: &corev1.EnvVar{Name: "GOMEMLIMIT", Value: "250MiB"},
 		},
 		{
 			name: "user-provided value wins when the limit is changed too",
@@ -225,4 +132,8 @@ func TestAutoOpsGoMemLimit(t *testing.T) {
 			require.Equal(t, []corev1.EnvVar{*tt.want}, got)
 		})
 	}
+}
+
+func memory(quantity string) corev1.ResourceList {
+	return corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)}
 }

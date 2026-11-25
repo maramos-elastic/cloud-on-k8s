@@ -40,12 +40,9 @@ const (
 	configVolumePath         = "/mnt/config"
 	configHashAnnotationName = "autoops.k8s.elastic.co/config-hash"
 	readinessProbePort       = 13133
-	// goMemLimitEnvVar is the soft memory limit of the Go runtime. Without it, the garbage collector
-	// is not aware of the container memory limit and the agent can be OOMKilled while most of its heap
-	// is reclaimable.
+	// goMemLimitEnvVar makes the Go garbage collector aware of the container memory limit.
 	goMemLimitEnvVar = "GOMEMLIMIT"
-	// goMemLimitPercent is the share of the container memory given to the Go heap. The rest is left
-	// for what the Go runtime does not account for (goroutine stacks, cgo, runtime overhead).
+	// goMemLimitPercent follows the OpenTelemetry memory_limiter guidance: 80% of the hard memory limit.
 	goMemLimitPercent = 80
 )
 
@@ -145,10 +142,9 @@ func (r *AgentPolicyReconciler) buildDeployment(configHash string, policy autoop
 			// RunAsNonRoot:           new(true),
 		})
 
-	// Must come after the resources are resolved, as the value is derived from them.
-	// WithEnv does not override a GOMEMLIMIT set by the user in the pod template.
+	// Must come after WithResourcesAndOverrides. WithEnv keeps a GOMEMLIMIT set in the pod template.
 	if main := builder.MainContainer(); main != nil {
-		if goMemLimit, ok := goMemLimitFor(main.Resources); ok {
+		if goMemLimit, ok := goMemLimitFor(main.Resources.Limits); ok {
 			builder = builder.WithEnv(corev1.EnvVar{Name: goMemLimitEnvVar, Value: goMemLimit})
 		}
 	}
@@ -174,21 +170,12 @@ func (r *AgentPolicyReconciler) buildDeployment(configHash string, policy autoop
 	}), nil
 }
 
-// goMemLimitFor returns the GOMEMLIMIT value for the given container resources: goMemLimitPercent of
-// the memory limit, or of the memory request when there is no limit, in MiB (for example "320MiB"
-// for 400Mi). It returns false when there is neither a memory limit nor a memory request, in which
-// case the Go runtime default (no limit) is kept.
-func goMemLimitFor(resources corev1.ResourceRequirements) (string, bool) {
-	memory, ok := resources.Limits[corev1.ResourceMemory]
-	if !ok || memory.IsZero() {
-		memory, ok = resources.Requests[corev1.ResourceMemory]
-	}
-	if !ok || memory.IsZero() {
-		return "", false
-	}
-	const mebibyte = int64(1024 * 1024)
-	// Divide first: memory.Value() can be large enough for the multiplication to overflow.
-	mebibytes := memory.Value() / 100 * goMemLimitPercent / mebibyte
+// goMemLimitFor returns goMemLimitPercent of the memory limit, rounded down to a whole MiB ("320MiB" for 400Mi).
+// It returns false without a memory limit: a memory request is not a ceiling.
+func goMemLimitFor(limits corev1.ResourceList) (string, bool) {
+	v := limits.Memory().Value()
+	// Split v in v/100 and v%100: exact, and v*goMemLimitPercent cannot overflow.
+	mebibytes := (v/100*goMemLimitPercent + v%100*goMemLimitPercent/100) / (1024 * 1024)
 	if mebibytes < 1 {
 		return "", false
 	}
